@@ -1,22 +1,18 @@
 import os
+import json
+import time
+import logging
+import datetime
+import urllib.parse
+import urllib.error
+import urllib.request
+from typing import Final as Const
+from datetime import date, timedelta
+from airflow.utils.dates import days_ago
 from airflow.models import DAG, Variable
 from airflow.operators.dummy_operator import DummyOperator
 from airflow.operators.python_operator import PythonOperator
 from airflow.operators.bash_operator import BashOperator
-from airflow.contrib.operators.bigquery_operator import BigQueryOperator
-from airflow.contrib.operators.bigquery_check_operator import BigQueryCheckOperator
-from airflow.providers.google.cloud.transfers.gcs_to_bigquery import GCSToBigQueryOperator
-from airflow.utils.dates import days_ago
-from datetime import timedelta 
-from functools import partial
-import json
-import time
-import urllib.parse
-import urllib.request
-import urllib.error
-import logging
-from datetime import date, timedelta
-from typing import Final as Const
 
 log = logging.getLogger(__name__)
 log.setLevel('DEBUG')
@@ -27,7 +23,11 @@ log.setLevel('DEBUG')
 
 GCS_BUCKET = Variable.get("gcs_bucket")
 GCP_PROJECT = Variable.get("gcp_project")
-INGESTION_DATASET = 'bright_data_ingestion'
+OUT_FORMAT: Const = "json"
+OUT_DIR: Const = "wiki/"
+START_DATE = datetime.date.today() - datetime.timedelta(days=1)
+FOLDER_DATE = START_DATE.strftime('%Y-%m-%d')
+formatted_date_string = START_DATE.strftime('%Y%m%d')
 
 ################################
 # config end ###################
@@ -50,39 +50,16 @@ dag = DAG(
     tags = ['scraping']
 )
 
-########################################
-# DUMMY OPERATORS ######################
-########################################
-
-start = DummyOperator(task_id='start', dag=dag)
-end = DummyOperator(task_id='end', dag=dag)
-
-########################################
-# OPERATORS ############################
-########################################
-
-# region Config
-# Output
-OUT_FORMAT: Const = "json"
-OUT_DIR: Const = "wiki/"
-START_DATE: Const = "20231001"
-
-# Misc
-# UPDATE_TIME: Const = "12:00"
 articles = (
     ("Hamas", "en"),
     ("Palestinian_Islamic_Jihad", "en")
 )
-#     ("����", "he"),
-#     ("��'����_�������_��������", "he")
-# endregion
 
 def to_timestamp(date: date):
     log.info(f'**{to_timestamp.__name__}**')
     return f"{date.year}{date.month}{date.day}"
 
-
-def get_page_data(article_name_: str, end_date: str, start_date: str = START_DATE, lang: str = "en") -> ():
+def get_page_data(article_name_: str, end_date: str, start_date: str = formatted_date_string, lang: str = "en") -> ():
     log.info(f'**{get_page_data.__name__}**')
     """
     Extract information and statistics about a certain page of the Wikipedia, from a certain date(s).
@@ -97,17 +74,17 @@ def get_page_data(article_name_: str, end_date: str, start_date: str = START_DAT
     url = u"https://wikimedia.org/api/rest_v1/metrics/pageviews/per-article/" \
           u"{}.wikipedia.org/all-access/all-agents/{}/daily/{}/{}" \
         .format(lang.lower(), urllib.parse.quote(article_name_), start_date, end_date)
+    log.info(f"url: {url}")
 
     try:
         page = urllib.request.urlopen(url).read()
-    except urllib.error.URLError:
+    except urllib.error.URLError as e:
         log.info("Update failed, No internet connection")
-        return
+        raise e
 
     page = page.decode("UTF-8")
     items = tuple(json.loads(page)["items"])
     return items
-
 
 def update_daily_data():
     log.info(f'**{update_daily_data.__name__}**')
@@ -116,19 +93,26 @@ def update_daily_data():
 
     for article in articles:
         article_name, article_lang = article
-        article_page_data = get_page_data(article_name, yesterday, lang=article_lang)
+        article_page_data = get_page_data(article_name, end_date=yesterday, lang=article_lang)
 
         if article_page_data is None:
             break
 
-        if not os.path.exists(OUT_DIR + article_name):
-            os.makedirs(OUT_DIR + article_name)
+        if not os.path.exists(f"{OUT_DIR + FOLDER_DATE}/{article_name}"):
+            os.makedirs(f"{OUT_DIR + FOLDER_DATE}/{article_name}")
 
         for daily_stats in article_page_data:
-            with open(f"{OUT_DIR + article_name}/{daily_stats['timestamp']}.{OUT_FORMAT}", 'w') as out_file:
+            with open(f"{OUT_DIR + FOLDER_DATE}/{article_name}/{daily_stats['timestamp']}.{OUT_FORMAT}", 'w') as out_file:
                 json.dump(daily_stats, out_file)
 
         log.info(f"Written JSON for '{article_name} (data for {len(article_page_data)} dates)'")
+
+########################################
+# DUMMY OPERATORS ######################
+########################################
+
+start = DummyOperator(task_id='start', dag=dag)
+end = DummyOperator(task_id='end', dag=dag)
 
 ########################################
 # OPERATORS ############################
@@ -143,7 +127,14 @@ OP_update_daily_data = PythonOperator(
 
 OP_load_wiki2gcs = BashOperator(
     task_id='OP_load_wiki2gcs',
-    bash_command=f"gsutil cp -r /home/omid/wiki/ gs://{GCS_BUCKET}/;",
+    bash_command=f"gsutil cp -r /{os.path.expanduser('~')}/wiki/{START_DATE}/ gs://{GCS_BUCKET}/wiki/;",
+    retries=1,
+    dag=dag
+)
+
+OP_delete_files_from_vm = BashOperator(
+    task_id='OP_delete_files_from_vm',
+    bash_command=f"rm -r {os.path.expanduser('~')}/wiki/*;",
     retries=1,
     dag=dag
 )
@@ -152,16 +143,5 @@ OP_load_wiki2gcs = BashOperator(
 # FLOW #################################
 ########################################
 
-start >> OP_update_daily_data >> OP_load_wiki2gcs >> end
+start >> OP_update_daily_data >> OP_load_wiki2gcs >> OP_delete_files_from_vm >> end
 
-
-if __name__ == "__main__":
-    schedule.every().day.at(UPDATE_TIME).do(update_daily_data)
-    update_daily_data()
-
-    try:
-        while True:
-            schedule.run_pending()
-            time.sleep(1)
-    except (KeyboardInterrupt, SystemExit):
-        print("Shutdown")
